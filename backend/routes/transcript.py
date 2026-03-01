@@ -1,3 +1,4 @@
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
@@ -31,7 +32,12 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Invalid YouTube URL")
 
 def write_cookies_file(tmpdir: str) -> str | None:
-    """Write YOUTUBE_COOKIES env var to a temp file for yt-dlp / transcript API."""
+    # First try secret file (Render production)
+    secret_path = "/etc/secrets/cookies.txt"
+    if os.path.exists(secret_path):
+        return secret_path
+
+    # Fallback: env variable (local dev)
     cookies_content = os.getenv("YOUTUBE_COOKIES")
     if not cookies_content:
         return None
@@ -74,16 +80,6 @@ async def get_transcript(request: TranscriptRequest):
         # ── 1. Try YouTube captions ──────────────────────────────────────────
         try:
             if cookies_path:
-                # Use yt-dlp to fetch subtitles when cookies are available
-                ydl_opts = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'skip_download': True,
-                    'writesubtitles': True,
-                    'writeautomaticsub': True,
-                    'subtitleslangs': ['en', 'en-US', 'en-GB'],
-                    'cookiefile': cookies_path,
-                }
                 transcript_list = YouTubeTranscriptApi.get_transcript(
                     video_id,
                     languages=['en', 'en-US', 'en-GB'],
