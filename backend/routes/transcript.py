@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
@@ -32,15 +31,22 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Invalid YouTube URL")
 
 def write_cookies_file(tmpdir: str) -> str | None:
+    cookies_content = None
+
     # First try secret file (Render production)
     secret_path = "/etc/secrets/cookies.txt"
     if os.path.exists(secret_path):
-        return secret_path
+        with open(secret_path, "r") as f:
+            cookies_content = f.read()
 
     # Fallback: env variable (local dev)
-    cookies_content = os.getenv("YOUTUBE_COOKIES")
+    if not cookies_content:
+        cookies_content = os.getenv("YOUTUBE_COOKIES")
+
     if not cookies_content:
         return None
+
+    # Always write to a writable temp location
     cookies_path = os.path.join(tmpdir, "cookies.txt")
     with open(cookies_path, "w") as f:
         f.write(cookies_content)
