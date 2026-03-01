@@ -26,23 +26,22 @@ def extract_video_id(url: str) -> str:
         return match.group(1)
     raise ValueError("Invalid YouTube URL")
 
-def get_video_metadata(url: str) -> dict:
-    """Get video metadata using yt-dlp (no auth needed for metadata on most videos)."""
+async def get_video_metadata(video_id: str) -> dict:
+    """Get video metadata using YouTube oEmbed API — no auth, no bot issues."""
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        async with httpx.AsyncClient(timeout=10) as client:
+            res = await client.get(oembed_url)
+        if res.status_code == 200:
+            data = res.json()
             return {
-                "title": info.get("title", "Unknown Title"),
-                "channel": info.get("uploader", "Unknown Channel"),
-                "duration": info.get("duration", 0),
+                "title": data.get("title", "Unknown Title"),
+                "channel": data.get("author_name", "Unknown Channel"),
+                "duration": 0,
             }
     except Exception:
-        return {"title": "Unknown Title", "channel": "Unknown Channel", "duration": 0}
+        pass
+    return {"title": "Unknown Title", "channel": "Unknown Channel", "duration": 0}
 
 @router.post("/", response_model=TranscriptResponse)
 async def get_transcript(request: TranscriptRequest):
@@ -51,7 +50,8 @@ async def get_transcript(request: TranscriptRequest):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-    metadata = get_video_metadata(request.url)
+    # oEmbed — no bot detection, no auth needed
+    metadata = await get_video_metadata(video_id)
 
     # ── 1. Supadata API (primary) ─────────────────────────────────────────
     supadata_key = os.getenv("SUPADATA_API_KEY")
@@ -65,12 +65,11 @@ async def get_transcript(request: TranscriptRequest):
                 )
             if res.status_code == 200:
                 data = res.json()
-                # Supadata returns list of {text, offset, duration}
                 transcript = []
                 for item in data.get("content", []):
                     transcript.append({
                         "text": item.get("text", ""),
-                        "start": item.get("offset", 0) / 1000,  # ms to seconds
+                        "start": item.get("offset", 0) / 1000,
                         "duration": item.get("duration", 2000) / 1000,
                     })
                 if transcript:
@@ -83,7 +82,7 @@ async def get_transcript(request: TranscriptRequest):
                         source="youtube_captions"
                     )
         except Exception:
-            pass  # Fall through to Whisper
+            pass
 
     # ── 2. Fallback: Whisper via OpenAI ──────────────────────────────────
     openai_key = os.getenv("OPENAI_API_KEY")
