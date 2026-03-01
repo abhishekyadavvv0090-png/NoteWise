@@ -7,7 +7,10 @@ import URLInput from "./components/URLInput.jsx";
 import CustomInput from "./components/CustomInput.jsx";
 import StatusBar from "./components/StatusBar.jsx";
 
-const API_BASE = "/api";
+// ✅ FIXED: Uses env variable in production, falls back to local proxy in dev
+const API_BASE = import.meta.env.VITE_API_URL
+  ? `${import.meta.env.VITE_API_URL}/api`
+  : "/api";
 
 export default function App() {
   const [url, setUrl] = useState("");
