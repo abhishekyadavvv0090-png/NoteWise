@@ -1,17 +1,16 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import google.generativeai as genai
+from groq import Groq
 import os
 import json
 
 router = APIRouter()
 
-def get_gemini_client():
-    api_key = os.getenv("GEMINI_API_KEY")
+def get_groq_client():
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set")
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.0-flash")
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
+    return Groq(api_key=api_key)
 
 class GenerateNotesRequest(BaseModel):
     transcript_chunk: list[dict]
@@ -24,12 +23,6 @@ class CustomInstructionRequest(BaseModel):
     video_title: str
     context_transcript: list[dict] = []
 
-class NoteItem(BaseModel):
-    timestamp: float
-    timestamp_label: str
-    content: str
-    type: str = "ai"
-
 def format_timestamp(seconds: float) -> str:
     mins = int(seconds // 60)
     secs = int(seconds % 60)
@@ -37,7 +30,7 @@ def format_timestamp(seconds: float) -> str:
 
 @router.post("/generate")
 async def generate_notes(request: GenerateNotesRequest):
-    model = get_gemini_client()
+    client = get_groq_client()
 
     transcript_text = "\n".join([
         f"[{format_timestamp(e['start'])}] {e['text']}"
@@ -47,27 +40,33 @@ async def generate_notes(request: GenerateNotesRequest):
     start_time = request.transcript_chunk[0]["start"] if request.transcript_chunk else 0
     timestamp_label = format_timestamp(start_time)
 
-    prompt = f"""You are NoteWise, an expert AI note-taking assistant.
-Your job is to create intelligent, concise, educational notes from video transcripts.
-
+    system_prompt = """You are NoteWise, an expert AI note-taking assistant.
+Generate intelligent, concise notes from video transcripts.
 Rules:
 - Be concise but comprehensive
 - Highlight key concepts, facts, definitions, and insights
-- Use clear language a student would understand
-- Return ONLY a JSON array of note objects, no markdown fences
-- Each note object: {{"timestamp": <float seconds>, "timestamp_label": "<MM:SS>", "content": "<note text>", "type": "ai"}}
-- Generate 1-3 notes per chunk depending on content density
+- Return ONLY a valid JSON array, no markdown fences, no explanation
+- Each note: {"timestamp": <float seconds>, "timestamp_label": "<MM:SS>", "content": "<note text>", "type": "ai"}
+- Generate 1-3 notes per chunk"""
 
-Video: {request.video_title}
+    user_prompt = f"""Video: {request.video_title}
 
-Transcript chunk:
+Transcript:
 {transcript_text}
 
-Return ONLY valid JSON array, nothing else."""
+Return ONLY a valid JSON array."""
 
     try:
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.3,
+        )
+        response_text = response.choices[0].message.content.strip()
         response_text = response_text.replace("```json", "").replace("```", "").strip()
         notes = json.loads(response_text)
         return {"notes": notes, "success": True}
@@ -86,34 +85,40 @@ Return ONLY valid JSON array, nothing else."""
 
 @router.post("/process-full-transcript")
 async def process_full_transcript(request: GenerateNotesRequest):
-    model = get_gemini_client()
+    client = get_groq_client()
 
     transcript_text = "\n".join([
         f"[{format_timestamp(e['start'])}] {e['text']}"
         for e in request.transcript_chunk
     ])
 
-    prompt = f"""You are NoteWise, an expert AI note-taking assistant.
-Generate comprehensive, intelligent notes from a video transcript.
-
+    system_prompt = """You are NoteWise, an expert AI note-taking assistant.
+Generate comprehensive notes from a full video transcript.
 Rules:
-- Create well-organized, timestamped notes
-- Group related content logically
-- Highlight key concepts, definitions, examples, and takeaways
-- Return ONLY a JSON array of note objects, no markdown fences
-- Each note: {{"timestamp": <float>, "timestamp_label": "<MM:SS>", "content": "<note>", "type": "ai"}}
-- Aim for one note per meaningful topic/section
+- Create well-organized timestamped notes
+- Highlight key concepts, definitions, examples, takeaways
+- Return ONLY a valid JSON array, no markdown fences, no explanation
+- Each note: {"timestamp": <float>, "timestamp_label": "<MM:SS>", "content": "<note>", "type": "ai"}
+- One note per meaningful topic/section"""
 
-Video: {request.video_title}
+    user_prompt = f"""Video: {request.video_title}
 
-Full transcript:
+Transcript:
 {transcript_text}
 
-Return ONLY valid JSON array, nothing else."""
+Return ONLY a valid JSON array."""
 
     try:
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=4000,
+            temperature=0.3,
+        )
+        response_text = response.choices[0].message.content.strip()
         response_text = response_text.replace("```json", "").replace("```", "").strip()
         notes = json.loads(response_text)
         return {"notes": notes, "success": True}
@@ -122,34 +127,40 @@ Return ONLY valid JSON array, nothing else."""
 
 @router.post("/custom-instruction")
 async def process_custom_instruction(request: CustomInstructionRequest):
-    model = get_gemini_client()
+    client = get_groq_client()
 
     existing_notes_text = "\n".join([
         f"[{n.get('timestamp_label', '00:00')}] {n.get('content', '')}"
         for n in request.current_notes
     ])
 
-    prompt = f"""You are NoteWise, an AI note-taking assistant.
-The user has given a custom instruction to enhance their notes.
-
+    system_prompt = """You are NoteWise, an AI note-taking assistant.
+Generate new notes based on the user's custom instruction.
 Rules:
-- Understand the user's instruction and generate new notes that satisfy it
-- Return ONLY a JSON array of NEW note objects to add, no markdown fences
-- Each note: {{"timestamp": <float>, "timestamp_label": "<MM:SS>", "content": "<note>", "type": "user"}}
-- Do NOT repeat existing notes
+- Return ONLY a valid JSON array of NEW notes to add, no markdown fences
+- Each note: {"timestamp": <float>, "timestamp_label": "<MM:SS>", "content": "<note>", "type": "user"}
+- Do NOT repeat existing notes"""
 
-Video: {request.video_title}
+    user_prompt = f"""Video: {request.video_title}
 
 Existing notes:
 {existing_notes_text}
 
 User instruction: {request.instruction}
 
-Return ONLY valid JSON array, nothing else."""
+Return ONLY a valid JSON array."""
 
     try:
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.3,
+        )
+        response_text = response.choices[0].message.content.strip()
         response_text = response_text.replace("```json", "").replace("```", "").strip()
         new_notes = json.loads(response_text)
         return {"notes": new_notes, "success": True}
