@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import yt_dlp
 import openai
 import os
 import re
+import json
 import tempfile
 
 router = APIRouter()
@@ -18,59 +18,42 @@ class TranscriptResponse(BaseModel):
     title: str
     channel: str
     duration: int
-    source: str  # "youtube_captions" or "whisper"
+    source: str
 
 def extract_video_id(url: str) -> str:
-    patterns = [
-        r'(?:v=|youtu\.be/|embed/)([a-zA-Z0-9_-]{11})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    match = re.search(r'(?:v=|youtu\.be/|embed/)([a-zA-Z0-9_-]{11})', url)
+    if match:
+        return match.group(1)
     raise ValueError("Invalid YouTube URL")
 
-def write_cookies_file(tmpdir: str) -> str | None:
-    cookies_content = None
-
-    # First try secret file (Render production)
+def get_cookies_path(tmpdir: str) -> str | None:
+    """Read cookies from Render secret file and copy to writable temp path."""
     secret_path = "/etc/secrets/cookies.txt"
     if os.path.exists(secret_path):
-        with open(secret_path, "r") as f:
-            cookies_content = f.read()
+        cookies_path = os.path.join(tmpdir, "cookies.txt")
+        with open(secret_path, "r") as src, open(cookies_path, "w") as dst:
+            dst.write(src.read())
+        return cookies_path
 
-    # Fallback: env variable (local dev)
-    if not cookies_content:
-        cookies_content = os.getenv("YOUTUBE_COOKIES")
+    # Fallback for local dev
+    cookies_content = os.getenv("YOUTUBE_COOKIES")
+    if cookies_content:
+        cookies_path = os.path.join(tmpdir, "cookies.txt")
+        with open(cookies_path, "w") as f:
+            f.write(cookies_content)
+        return cookies_path
 
-    if not cookies_content:
-        return None
+    return None
 
-    # Always write to a writable temp location
-    cookies_path = os.path.join(tmpdir, "cookies.txt")
-    with open(cookies_path, "w") as f:
-        f.write(cookies_content)
-    return cookies_path
-
-def get_video_metadata(url: str, cookies_path: str | None) -> dict:
-    ydl_opts = {
+def base_ydl_opts(cookies_path: str | None) -> dict:
+    opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
     }
     if cookies_path:
-        ydl_opts['cookiefile'] = cookies_path
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return {
-                "title": info.get("title", "Unknown Title"),
-                "channel": info.get("uploader", "Unknown Channel"),
-                "duration": info.get("duration", 0),
-            }
-    except Exception:
-        return {"title": "Unknown Title", "channel": "Unknown Channel", "duration": 0}
+        opts['cookiefile'] = cookies_path
+    return opts
 
 @router.post("/", response_model=TranscriptResponse)
 async def get_transcript(request: TranscriptRequest):
@@ -80,48 +63,79 @@ async def get_transcript(request: TranscriptRequest):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        cookies_path = write_cookies_file(tmpdir)
-        metadata = get_video_metadata(request.url, cookies_path)
+        cookies_path = get_cookies_path(tmpdir)
 
-        # ── 1. Try YouTube captions ──────────────────────────────────────────
+        # ── 1. Get video metadata ─────────────────────────────────────────
+        metadata = {"title": "Unknown Title", "channel": "Unknown Channel", "duration": 0}
         try:
-            if cookies_path:
-                transcript_list = YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    languages=['en', 'en-US', 'en-GB'],
-                    cookies=cookies_path,
-                )
-            else:
-                transcript_list = YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    languages=['en', 'en-US', 'en-GB'],
-                )
+            with yt_dlp.YoutubeDL(base_ydl_opts(cookies_path)) as ydl:
+                info = ydl.extract_info(request.url, download=False)
+                metadata = {
+                    "title": info.get("title", "Unknown Title"),
+                    "channel": info.get("uploader", "Unknown Channel"),
+                    "duration": info.get("duration", 0),
+                }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch video info: {str(e)}")
 
-            return TranscriptResponse(
-                transcript=transcript_list,
-                video_id=video_id,
-                title=metadata["title"],
-                channel=metadata["channel"],
-                duration=metadata["duration"],
-                source="youtube_captions"
-            )
-        except (TranscriptsDisabled, NoTranscriptFound):
-            pass
+        # ── 2. Try downloading subtitles via yt-dlp ───────────────────────
+        try:
+            subtitle_path = os.path.join(tmpdir, "subs")
+            ydl_opts = {
+                **base_ydl_opts(cookies_path),
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['en', 'en-US', 'en-GB'],
+                'subtitlesformat': 'json3',
+                'outtmpl': subtitle_path,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([request.url])
+
+            # Find the downloaded subtitle file
+            sub_file = None
+            for f in os.listdir(tmpdir):
+                if f.startswith("subs") and f.endswith(".json3"):
+                    sub_file = os.path.join(tmpdir, f)
+                    break
+
+            if sub_file:
+                with open(sub_file, "r") as f:
+                    sub_data = json.load(f)
+
+                transcript = []
+                for event in sub_data.get("events", []):
+                    if "segs" not in event:
+                        continue
+                    text = "".join(s.get("utf8", "") for s in event["segs"]).strip()
+                    if not text or text == "\n":
+                        continue
+                    start = event.get("tStartMs", 0) / 1000
+                    duration = event.get("dDurationMs", 2000) / 1000
+                    transcript.append({"text": text, "start": start, "duration": duration})
+
+                if transcript:
+                    return TranscriptResponse(
+                        transcript=transcript,
+                        video_id=video_id,
+                        title=metadata["title"],
+                        channel=metadata["channel"],
+                        duration=metadata["duration"],
+                        source="youtube_captions"
+                    )
         except Exception:
             pass
 
-        # ── 2. Fallback: Whisper via OpenAI ──────────────────────────────────
+        # ── 3. Fallback: Whisper via OpenAI ──────────────────────────────
         openai_key = os.getenv("OPENAI_API_KEY")
         if not openai_key:
             raise HTTPException(
                 status_code=422,
-                detail="No YouTube captions available and no OpenAI API key set for Whisper fallback."
+                detail="No captions found and no OpenAI API key set for Whisper fallback."
             )
 
         try:
             client = openai.OpenAI(api_key=openai_key)
-            audio_path = os.path.join(tmpdir, "audio.mp3")
-
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': os.path.join(tmpdir, 'audio.%(ext)s'),
@@ -137,10 +151,14 @@ async def get_transcript(request: TranscriptRequest):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([request.url])
 
+            audio_path = None
             for f in os.listdir(tmpdir):
                 if f.endswith('.mp3'):
                     audio_path = os.path.join(tmpdir, f)
                     break
+
+            if not audio_path:
+                raise Exception("Audio download failed")
 
             with open(audio_path, 'rb') as audio_file:
                 whisper_response = client.audio.transcriptions.create(
